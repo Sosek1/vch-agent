@@ -16,7 +16,8 @@ is saved on this machine.
 
 The install is one step once these are true:
 
-- An account on Video Changelog Hub. The author creates accounts; ask them if you do not have one yet.
+- An account on Video Changelog Hub. Sign up at <https://video-changelog-hub.bscode03.workers.dev/auth/signup> or ask
+  the author for one.
 - Claude Code 2.1.275 or newer (`claude --version`).
 - Node.js 22.12 or newer on your `PATH` (`node --version`).
 - `@playwright/test` 1.61 or newer in the repository you want to demo. The agent offers to install or upgrade

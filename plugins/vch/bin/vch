@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // vch: logs an agent in to Video Changelog Hub, uploads a recorded demo (video + events.json from
 // vch-fixture.mjs) as a draft and waits for its narrated render.
-// Zero dependencies on purpose (Node >= 18, global fetch).
+// Zero dependencies on purpose (Node >= 18 with global fetch when run as vch.mjs; the plugin's extensionless bin/vch needs Node >= 22.12).
 //
 // Usage:
 //   node vch.mjs login
@@ -34,8 +34,11 @@ const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const COMPLETE_RETRIES = 3;
 const COMPLETE_RETRY_DELAY_MS = 2000;
 const RENDER_POLL_INTERVAL_MS = 10 * 1000;
-// Kept under the agent's 10-minute Bash tool limit, so the command reports a clean stop before the tool kills it.
-const RENDER_WAIT_MS = 9 * 60 * 1000;
+// The whole of `create` (upload, then the render wait) stops within this, measured from the first request, so
+// it ends cleanly before the agent's default 10-minute Bash tool limit kills it.
+const CREATE_BUDGET_MS = 9 * 60 * 1000;
+// A request to the hub that hangs this long fails instead of eating the budget.
+const API_TIMEOUT_MS = 30 * 1000;
 
 // Must match the server's limits (src/lib/services/demos.ts, src/lib/services/areas.ts).
 const LIMITS = { title: 120, description: 2000, transcript: 10000, area: 60 };
@@ -82,7 +85,7 @@ const USAGE = `Usage:
   node vch.mjs logout                         Revoke this agent's token on the server and forget it locally
   node vch.mjs create --title-file <f> --description-file <f> --events <events.json> --video <demo.webm>
                                               Upload a recording made with vch-fixture.mjs as a new draft and
-                                              wait (up to 9 min) for its narrated render. The transcript is the
+                                              wait for its narrated render (all within 9 min). The transcript is the
                                               say() text from events.json. (--title <t> instead of --title-file also works)
                                               [--area-file <f>]  Product area, an exact name from \`areas list\`
                                               (--area <a> instead of --area-file also works)
@@ -181,6 +184,7 @@ async function api(baseUrl, path, { method = "GET", body, token } = {}) {
       method,
       headers,
       body: method === "GET" ? undefined : JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
     });
   } catch (error) {
     throw new CliError(`Cannot reach ${baseUrl}: ${error.message}`);
@@ -351,11 +355,24 @@ function readEvents(path) {
 
 // A Buffer body is sent with an exact Content-Length; a streamed body would go out chunked,
 // which presigned S3-compatible PUTs reject. The presign covers Content-Type, so send exactly that type.
-async function putFile(label, url, contentType, body) {
+const formatElapsed = (ms) => `${Math.floor(ms / 60000)}m ${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}s`;
+
+// The deadline bounds the PUT, so a slow uplink fails with a message rather than being killed mid-upload.
+async function putFile(label, url, contentType, body, deadline) {
   let upload;
   try {
-    upload = await fetch(url, { method: "PUT", headers: { "Content-Type": contentType }, body });
+    upload = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      body,
+      signal: AbortSignal.timeout(Math.max(deadline - Date.now(), 1)),
+    });
   } catch (error) {
+    if (error.name === "TimeoutError") {
+      throw new CliError(
+        `${label} upload did not finish within ${formatElapsed(CREATE_BUDGET_MS)}. The draft was left without a recording; record a shorter demo or retry on a faster connection.`,
+      );
+    }
     throw new CliError(`${label} upload failed: ${error.message}`);
   }
   if (!upload.ok) {
@@ -364,17 +381,16 @@ async function putFile(label, url, contentType, body) {
   }
 }
 
-const formatElapsed = (ms) => `${Math.floor(ms / 60000)}m ${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}s`;
-
 // Polls the draft while the narrated video renders. The draft already exists, so a failed poll never
 // fails the command: transient errors are retried, anything else stops the wait with the last known state.
-async function waitForRender(baseUrl, token, demo) {
+async function waitForRender(baseUrl, token, demo, deadline) {
   const statusPath = `/api/demos/${encodeURIComponent(demo.id)}`;
   const started = Date.now();
   let current = demo;
   while (current.render_status === "rendering") {
     const elapsed = Date.now() - started;
-    if (elapsed >= RENDER_WAIT_MS) {
+    // Stop before a poll that could finish past the deadline.
+    if (Date.now() + RENDER_POLL_INTERVAL_MS + API_TIMEOUT_MS > deadline) {
       console.error(
         `Stopped waiting after ${formatElapsed(elapsed)}; the render is still running. The draft plays the raw recording until it finishes.`,
       );
@@ -430,6 +446,7 @@ async function create(baseUrl, values) {
 
   // stderr, so stdout stays pure JSON.
   console.error(`Creating draft on ${baseUrl}`);
+  const deadline = Date.now() + CREATE_BUDGET_MS;
   // Sent only when given, so the request matches what kits without areas send.
   const body = { title, description, transcript, ...(area ? { area } : {}) };
   const created = await api(baseUrl, "/api/demos", { method: "POST", token, body });
@@ -445,8 +462,8 @@ async function create(baseUrl, values) {
   const { id, upload_url, events_upload_url } = created.json;
 
   console.error("Uploading recording");
-  await putFile("Video", upload_url, "video/webm", readFileSync(videoPath));
-  await putFile("events.json", events_upload_url, "application/json", events);
+  await putFile("Video", upload_url, "video/webm", readFileSync(videoPath), deadline);
+  await putFile("events.json", events_upload_url, "application/json", events, deadline);
 
   const completePath = `/api/demos/${encodeURIComponent(id)}/complete`;
   let demo;
@@ -465,8 +482,12 @@ async function create(baseUrl, values) {
     throw new CliError(describe(completePath, done));
   }
 
+  // Printed before the wait, so a run cut off during it still leaves the draft's address behind.
+  console.error(
+    `Draft created: ${demo.draft_url} (id ${demo.id}). If this command is cut off from here on, the draft exists; do not run create again.`,
+  );
   // Exit 0 whether the render succeeds, fails or is still running: the draft exists either way.
-  demo = await waitForRender(baseUrl, token, demo);
+  demo = await waitForRender(baseUrl, token, demo, deadline);
   const { status, render_status, render_error, draft_url } = demo;
   console.log(
     JSON.stringify(
