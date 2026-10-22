@@ -1,0 +1,11 @@
+{
+  "name": "vch",
+  "owner": { "name": "Bartosz Sosin" },
+  "plugins": [
+    {
+      "name": "vch",
+      "source": "./plugins/vch",
+      "description": "Record a feature as a narrated demo draft in Video Changelog Hub."
+    }
+  ]
+}

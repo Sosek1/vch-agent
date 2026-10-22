@@ -1,0 +1,740 @@
+#!/usr/bin/env node
+// vch: logs an agent in to Video Changelog Hub, uploads a recorded demo (video + events.json from
+// vch-fixture.mjs) as a draft and waits for its narrated render.
+// Zero dependencies on purpose (Node >= 18, global fetch).
+//
+// Usage:
+//   node vch.mjs login
+//   node vch.mjs whoami
+//   node vch.mjs logout
+//   node vch.mjs create --title-file <f> --description-file <f> --events <events.json> --video <demo.webm> [--area-file <f>]
+//   node vch.mjs areas list
+//   node vch.mjs areas add --name-file <f>
+//   node vch.mjs config save --from <file.json>
+//   node vch.mjs fixture install [--dir <dir>]
+//   node vch.mjs status [--hook]
+//
+// Exit codes: 0 ok, 2 missing or rejected token (run `login`), 1 any other error.
+// Exception: `status --hook` always exits 0 — its output feeds a SessionStart hook, which must never break.
+
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath, URL } from "node:url";
+import { parseArgs } from "node:util";
+
+// Replaced with the app's origin when the server serves this file (src/pages/agent/draft-demo/vch.mjs.ts).
+const DEFAULT_BASE_URL = "https://video-changelog-hub.bscode03.workers.dev";
+
+const CREDENTIALS_DIR = join(homedir(), ".config", "vch");
+const CREDENTIALS_FILE = join(CREDENTIALS_DIR, "credentials.json");
+
+const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const COMPLETE_RETRIES = 3;
+const COMPLETE_RETRY_DELAY_MS = 2000;
+const RENDER_POLL_INTERVAL_MS = 10 * 1000;
+const RENDER_WAIT_MS = 25 * 60 * 1000;
+
+// Must match the server's limits (src/lib/services/demos.ts, src/lib/services/areas.ts).
+const LIMITS = { title: 120, description: 2000, transcript: 10000, area: 60 };
+const MAX_RECORDING_BYTES = 500 * 1024 * 1024;
+// Must match MAX_EVENTS_BYTES in src/lib/services/demos.ts.
+const MAX_EVENTS_BYTES = 1024 * 1024;
+
+// Mirrors EVENTS_LIMITS, TRANSCRIPT_SEPARATOR and narrationChars() in render-worker/src/events.ts
+// (the kit can't import it). The transcript limit is LIMITS.transcript, the same as narrationChars there.
+const EVENTS_LIMITS = { events: 2000, segments: 100, segmentChars: 1000 };
+const TRANSCRIPT_SEPARATOR = "\n\n";
+
+// Per-project settings the skill remembers between demos. Written from the repo root.
+const PROJECT_CONFIG_FILE = join(".claude", "demo.json");
+const PROJECT_CONFIG_KEYS = [
+  "appUrl",
+  "startCommand",
+  "storageState",
+  "specDir",
+  "playwrightConfig",
+  "uiLanguage",
+  "fixtureDir",
+];
+
+// The recording fixture ships next to this script in every distribution (the repo's src/agent-kit/, the
+// plugin's bin/ and a kit copied into .claude/skills/draft-demo/), so resolve it from this file, not the cwd.
+const FIXTURE_NAME = "vch-fixture.mjs";
+const BUNDLED_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), FIXTURE_NAME);
+// Bump when the fixture's contract changes; `status` warns about every copy stamped below it.
+const FIXTURE_VERSION = 1;
+const FIXTURE_STAMP = (v) => `// vch-fixture v${v} — installed by \`vch fixture install\`; do not edit by hand\n`;
+const FIXTURE_STAMP_PATTERN = /^\/\/ vch-fixture v(\d+)\b/;
+const DEFAULT_FIXTURE_DIR = "e2e";
+// Where `status` looks for an installed copy when the project config does not name a directory.
+const FIXTURE_SEARCH_DIRS = [DEFAULT_FIXTURE_DIR, join("tests", "e2e"), join(".claude", "skills", "draft-demo")];
+// Writes here route to the auto-mode classifier even when a permission rule matches, so the kit never
+// installs into it; its presence also means a pre-plugin kit copy is still in the repo.
+const PROTECTED_DIR = ".claude";
+const LEGACY_KIT_DIR = join(".claude", "skills", "draft-demo");
+
+const USAGE = `Usage:
+  node vch.mjs login                          Log this agent in (prints a link to approve in the browser)
+  node vch.mjs whoami                         Check the stored token and print the account it belongs to
+  node vch.mjs logout                         Revoke this agent's token on the server and forget it locally
+  node vch.mjs create --title-file <f> --description-file <f> --events <events.json> --video <demo.webm>
+                                              Upload a recording made with vch-fixture.mjs as a new draft and
+                                              wait (up to 25 min) for its narrated render. The transcript is the
+                                              say() text from events.json. (--title <t> instead of --title-file also works)
+                                              [--area-file <f>]  Product area, an exact name from \`areas list\`
+                                              (--area <a> instead of --area-file also works)
+  node vch.mjs areas list                     Print the product areas as JSON (pick a demo's area from these)
+  node vch.mjs areas add --name-file <f>      Add a product area (--name <n> also works); only when the developer asks
+  node vch.mjs config save --from <file.json>  Write .claude/demo.json in the current directory (run from the repo root)
+  node vch.mjs fixture install [--dir <dir>]  Copy the Playwright recording fixture into the repo so a committed
+                                              spec can import it (default --dir ${DEFAULT_FIXTURE_DIR}; never inside ${PROTECTED_DIR}/)
+  node vch.mjs status [--hook]                Report what this machine knows locally — token, fixture copies, legacy
+                                              kit — without a network call. --hook prints SessionStart context and
+                                              always exits 0.
+
+Server: the origin the script was downloaded from. For local development, set VCH_BASE_URL.
+(There is deliberately no --base-url flag: the permission rule for this script must not let it send data elsewhere.)
+Exit codes: 0 ok, 2 missing or rejected token (run login), 1 any other error.`;
+
+class CliError extends Error {
+  constructor(message, exitCode = 1) {
+    super(message);
+    this.exitCode = exitCode;
+  }
+}
+
+// How this copy was invoked: `vch` when it runs as the plugin's binary, `node <path>` when it runs as a
+// file. One string for both distributions, so every hint names a command the developer can actually paste.
+const invocation = () => {
+  const entry = process.argv[1] ?? "vch.mjs";
+  return basename(entry) === "vch" ? "vch" : `node ${entry}`;
+};
+
+const needsLogin = (message) => new CliError(`${message} Run: ${invocation()} login`, 2);
+
+function resolveBaseUrl() {
+  const raw = process.env.VCH_BASE_URL ?? DEFAULT_BASE_URL;
+  if (!raw || raw.startsWith("__")) {
+    throw new CliError("No base URL. Set VCH_BASE_URL (this copy was not downloaded from the server).");
+  }
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new CliError(`Invalid base URL: ${raw}`);
+  }
+  // The token travels in a header, so plain http is only allowed for local development.
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) {
+    throw new CliError(`Refusing ${url.origin}: use https (plain http only for localhost).`);
+  }
+  return url.origin;
+}
+
+function readCredentials() {
+  if (!existsSync(CREDENTIALS_FILE)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(CREDENTIALS_FILE, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    // Deleting the file does not revoke the tokens in it; point at the server-side way out too.
+    throw new CliError(
+      `Cannot read ${CREDENTIALS_FILE}; fix or delete it and run login again. ` +
+        `Deleting it does not revoke its tokens: use Dashboard → "Disconnect agents" for that.`,
+    );
+  }
+}
+
+function writeCredentials(credentials) {
+  mkdirSync(CREDENTIALS_DIR, { recursive: true, mode: 0o700 });
+  // mkdirSync keeps the mode of an existing directory; enforce it.
+  chmodSync(CREDENTIALS_DIR, 0o700);
+  // Write a temp file and rename it over the original, so a crash mid-write can't truncate the
+  // tokens of every server.
+  const temp = `${CREDENTIALS_FILE}.tmp`;
+  writeFileSync(temp, JSON.stringify(credentials, null, 2) + "\n", { mode: 0o600 });
+  // writeFileSync keeps the mode of an existing file; enforce it.
+  chmodSync(temp, 0o600);
+  renameSync(temp, CREDENTIALS_FILE);
+}
+
+function saveToken(baseUrl, token) {
+  writeCredentials({ ...readCredentials(), [baseUrl]: token });
+}
+
+function forgetToken(baseUrl) {
+  const { [baseUrl]: _removed, ...rest } = readCredentials();
+  writeCredentials(rest);
+}
+
+// Every POST carries Content-Type: application/json; the server's CSRF check rejects POSTs without one.
+async function api(baseUrl, path, { method = "GET", body, token } = {}) {
+  const headers = {};
+  if (method !== "GET") headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = `Bearer ${token}`;
+  let response;
+  try {
+    response = await fetch(baseUrl + path, {
+      method,
+      headers,
+      body: method === "GET" ? undefined : JSON.stringify(body ?? {}),
+    });
+  } catch (error) {
+    throw new CliError(`Cannot reach ${baseUrl}: ${error.message}`);
+  }
+  let json = null;
+  try {
+    json = await response.json();
+  } catch {
+    // Non-JSON body; the status code is what matters.
+  }
+  return { status: response.status, json };
+}
+
+function describe(path, { status, json }) {
+  const detail = json?.error ? ` ${json.error}` : "";
+  const issues = json?.issues?.length ? `\n${JSON.stringify(json.issues, null, 2)}` : "";
+  return `${path} failed: HTTP ${status}${detail}${issues}`;
+}
+
+// Names the account the developer just approved with, so an approval from the wrong account is caught here
+// instead of when a demo turns up under someone else's name. The token is already saved, so a failed
+// whoami is reported, not fatal.
+async function reportAccount(baseUrl, token) {
+  let result = null;
+  try {
+    result = await api(baseUrl, "/api/cli/whoami", { token });
+  } catch {
+    // Network error right after the exchange; the saved token is still good.
+  }
+  if (result?.status === 200 && typeof result.json?.email === "string") {
+    console.log(`Logged in to ${baseUrl} as ${result.json.email}`);
+    console.log(`Token saved to ${CREDENTIALS_FILE}.`);
+    return;
+  }
+  console.log(`Logged in. Token saved to ${CREDENTIALS_FILE}.`);
+  console.log(`Could not read which account approved it. Run: ${invocation()} whoami`);
+}
+
+async function login(baseUrl) {
+  const start = await api(baseUrl, "/api/cli/device", { method: "POST" });
+  if (start.status !== 200 || !start.json?.device_code) {
+    throw new CliError(describe("/api/cli/device", start));
+  }
+  const { device_code, user_code, verification_url, expires_in, interval } = start.json;
+
+  console.log("To authorize this agent, open this link and approve:");
+  console.log(`\n  ${verification_url}\n`);
+  console.log(`Confirm the code shown there is: ${user_code}`);
+  console.log("Waiting for approval...");
+
+  const intervalMs = Math.max(1, Number(interval) || 5) * 1000;
+  const deadline = Date.now() + Math.min(LOGIN_TIMEOUT_MS, (Number(expires_in) || 600) * 1000);
+  while (Date.now() < deadline) {
+    await sleep(intervalMs);
+    const poll = await api(baseUrl, "/api/cli/token", { method: "POST", body: { device_code } });
+    if (poll.status === 200 && poll.json?.access_token) {
+      saveToken(baseUrl, poll.json.access_token);
+      await reportAccount(baseUrl, poll.json.access_token);
+      return;
+    }
+    if (poll.status === 428) continue;
+    if (poll.status === 410) {
+      throw new CliError("Login code expired or was declined in the browser. Run login again.");
+    }
+    throw new CliError(describe("/api/cli/token", poll));
+  }
+  throw new CliError("Timed out waiting for approval. Run login again.");
+}
+
+async function whoami(baseUrl) {
+  const token = readCredentials()[baseUrl];
+  if (!token) throw needsLogin(`Not logged in to ${baseUrl}.`);
+
+  const result = await api(baseUrl, "/api/cli/whoami", { token });
+  if (result.status === 401) throw needsLogin(`Token for ${baseUrl} was rejected.`);
+  if (result.status !== 200 || typeof result.json?.email !== "string") {
+    throw new CliError(describe("/api/cli/whoami", result));
+  }
+  console.log(`Logged in to ${baseUrl} as ${result.json.email}`);
+}
+
+async function logout(baseUrl) {
+  const token = readCredentials()[baseUrl];
+  if (!token) {
+    console.log(`Not logged in to ${baseUrl}.`);
+    return;
+  }
+
+  // 401 means the server already rejects the token (expired or revoked); forget it either way.
+  // On any other failure keep the token, so logout can be retried.
+  const result = await api(baseUrl, "/api/cli/logout", { method: "POST", token });
+  if (result.status !== 204 && result.status !== 401) throw new CliError(describe("/api/cli/logout", result));
+  forgetToken(baseUrl);
+  console.log(`Logged out of ${baseUrl}.`);
+}
+
+/** The trimmed text of `--<name>` or `--<name>-file` (not both), or "" when neither is given. */
+function textOption(values, name, max) {
+  if (values[name] && values[`${name}-file`]) throw new CliError(`Pass either --${name} or --${name}-file, not both.`);
+  const text = values[`${name}-file`] ? readTextFile(name, values[`${name}-file`], max) : (values[name] ?? "").trim();
+  if (text.length > max) throw new CliError(`${name} is ${text.length} characters; the limit is ${max}.`);
+  return text;
+}
+
+function readTextFile(label, path, max) {
+  if (!path) throw new CliError(`Missing --${label}-file.\n\n${USAGE}`);
+  if (!existsSync(path)) throw new CliError(`--${label}-file not found: ${path}`);
+  const text = readFileSync(path, "utf8").trim();
+  if (!text) throw new CliError(`--${label}-file is empty: ${path}`);
+  if (text.length > max) throw new CliError(`${label} is ${text.length} characters; the limit is ${max}.`);
+  return text;
+}
+
+// Local checks mirroring the renderer's events.json contract (render-worker/src/events.ts), so an
+// over-limit recording fails here, before anything is uploaded. Returns the transcript: the say() texts,
+// trimmed and joined exactly as narrationChars() counts them.
+function readEvents(path) {
+  if (!path) throw new CliError(`Missing --events.\n\n${USAGE}`);
+  if (!existsSync(path) || !statSync(path).isFile()) throw new CliError(`--events not found: ${path}`);
+  const size = statSync(path).size;
+  if (size > MAX_EVENTS_BYTES) {
+    throw new CliError(`events.json is ${size} bytes; the limit is ${MAX_EVENTS_BYTES} (1 MB). Record a shorter demo.`);
+  }
+  const bytes = readFileSync(path);
+  let file;
+  try {
+    file = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new CliError(`--events is not valid JSON: ${path}`);
+  }
+  if (!file || typeof file !== "object" || Array.isArray(file)) {
+    throw new CliError("events.json must be a JSON object.");
+  }
+  if (file.version !== 1) {
+    throw new CliError("Unsupported events.json version (expected 1). Record it with vch-fixture.mjs.");
+  }
+  if (!Array.isArray(file.events)) throw new CliError("events.json has no events array.");
+  if (file.events.length > EVENTS_LIMITS.events) {
+    throw new CliError(`events.json has ${file.events.length} events; the limit is ${EVENTS_LIMITS.events}.`);
+  }
+  const { narration } = file;
+  if (!Array.isArray(narration) || narration.length === 0) {
+    throw new CliError("events.json has no narration. Narrate the demo with vch.say() in the spec.");
+  }
+  if (narration.length > EVENTS_LIMITS.segments) {
+    throw new CliError(
+      `events.json has ${narration.length} narration segments; the limit is ${EVENTS_LIMITS.segments}.`,
+    );
+  }
+  const texts = narration.map((segment, i) => {
+    const text = typeof segment?.text === "string" ? segment.text.trim() : "";
+    if (!text) throw new CliError(`narration[${i}].text is empty.`);
+    if (text.length > EVENTS_LIMITS.segmentChars) {
+      throw new CliError(
+        `narration[${i}].text is ${text.length} characters; the limit is ${EVENTS_LIMITS.segmentChars} per say().`,
+      );
+    }
+    return text;
+  });
+  const transcript = texts.join(TRANSCRIPT_SEPARATOR);
+  if (transcript.length > LIMITS.transcript) {
+    throw new CliError(
+      `Narration is ${transcript.length} characters in total; the limit is ${LIMITS.transcript}. Shorten the say() texts.`,
+    );
+  }
+  return { transcript, bytes };
+}
+
+// A Buffer body is sent with an exact Content-Length; a streamed body would go out chunked,
+// which presigned S3-compatible PUTs reject. The presign covers Content-Type, so send exactly that type.
+async function putFile(label, url, contentType, body) {
+  let upload;
+  try {
+    upload = await fetch(url, { method: "PUT", headers: { "Content-Type": contentType }, body });
+  } catch (error) {
+    throw new CliError(`${label} upload failed: ${error.message}`);
+  }
+  if (!upload.ok) {
+    const text = await upload.text().catch(() => "");
+    throw new CliError(`${label} upload failed: HTTP ${upload.status}${text ? `\n${text.slice(0, 500)}` : ""}`);
+  }
+}
+
+const formatElapsed = (ms) => `${Math.floor(ms / 60000)}m ${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}s`;
+
+// Polls the draft while the narrated video renders. The draft already exists, so a failed poll never
+// fails the command: transient errors are retried, anything else stops the wait with the last known state.
+async function waitForRender(baseUrl, token, demo) {
+  const statusPath = `/api/demos/${encodeURIComponent(demo.id)}`;
+  const started = Date.now();
+  let current = demo;
+  while (current.render_status === "rendering") {
+    const elapsed = Date.now() - started;
+    if (elapsed >= RENDER_WAIT_MS) {
+      console.error(
+        `Stopped waiting after ${formatElapsed(elapsed)}; the render is still running. The draft plays the raw recording until it finishes.`,
+      );
+      return current;
+    }
+    console.error(`Rendering the narrated video... ${formatElapsed(elapsed)} elapsed`);
+    await sleep(RENDER_POLL_INTERVAL_MS);
+    let poll;
+    try {
+      poll = await api(baseUrl, statusPath, { token });
+    } catch (error) {
+      console.error(`vch: ${error.message}; retrying.`);
+      continue;
+    }
+    if (poll.status === 200 && poll.json) {
+      current = { ...current, render_status: poll.json.render_status, render_error: poll.json.render_error };
+      continue;
+    }
+    if (poll.status >= 500) {
+      console.error(`vch: ${describe(statusPath, poll)}; retrying.`);
+      continue;
+    }
+    console.error(`vch: ${describe(statusPath, poll)}; stopped waiting for the render.`);
+    return current;
+  }
+  return current;
+}
+
+async function create(baseUrl, values) {
+  // Validate everything locally before any network call.
+  const title = textOption(values, "title", LIMITS.title);
+  if (!title) throw new CliError(`Missing --title-file.\n\n${USAGE}`);
+  const area = textOption(values, "area", LIMITS.area);
+  const description = readTextFile("description", values["description-file"], LIMITS.description);
+  const { transcript, bytes: events } = readEvents(values.events);
+
+  const videoPath = values.video;
+  if (!videoPath) throw new CliError(`Missing --video.\n\n${USAGE}`);
+  if (!existsSync(videoPath) || !statSync(videoPath).isFile()) {
+    throw new CliError(`--video not found: ${videoPath}`);
+  }
+  if (!videoPath.toLowerCase().endsWith(".webm")) throw new CliError(`--video must be a .webm file: ${videoPath}`);
+  const size = statSync(videoPath).size;
+  if (size === 0) throw new CliError(`--video is empty: ${videoPath}`);
+  if (size > MAX_RECORDING_BYTES) {
+    throw new CliError(
+      `Recording is ${size} bytes; the limit is ${MAX_RECORDING_BYTES} (500 MB). Record a shorter demo.`,
+    );
+  }
+
+  const token = readCredentials()[baseUrl];
+  if (!token) throw needsLogin(`Not logged in to ${baseUrl}.`);
+
+  // stderr, so stdout stays pure JSON.
+  console.error(`Creating draft on ${baseUrl}`);
+  // Sent only when given, so the request matches what kits without areas send.
+  const body = { title, description, transcript, ...(area ? { area } : {}) };
+  const created = await api(baseUrl, "/api/demos", { method: "POST", token, body });
+  if (created.status === 401) throw needsLogin("Token was rejected.");
+  if (created.status === 400 && created.json?.error === "unknown_area") {
+    throw new CliError(
+      `Unknown product area: ${area}. Nothing was uploaded. Run \`node vch.mjs areas list\` and pass an exact name, or omit the area.`,
+    );
+  }
+  if (created.status !== 201 || !created.json?.upload_url || !created.json?.events_upload_url) {
+    throw new CliError(describe("/api/demos", created));
+  }
+  const { id, upload_url, events_upload_url } = created.json;
+
+  console.error("Uploading recording");
+  await putFile("Video", upload_url, "video/webm", readFileSync(videoPath));
+  await putFile("events.json", events_upload_url, "application/json", events);
+
+  const completePath = `/api/demos/${encodeURIComponent(id)}/complete`;
+  let demo;
+  for (let attempt = 1; ; attempt++) {
+    const done = await api(baseUrl, completePath, { method: "POST", token });
+    if (done.status === 401) throw needsLogin("Token was rejected.");
+    if (done.status === 200 && done.json) {
+      const { status, draft_url, render_status, render_error } = done.json;
+      demo = { id: done.json.id, status, render_status, render_error, draft_url };
+      break;
+    }
+    if (done.status === 409 && done.json?.error === "not_uploaded" && attempt < COMPLETE_RETRIES) {
+      await sleep(COMPLETE_RETRY_DELAY_MS);
+      continue;
+    }
+    throw new CliError(describe(completePath, done));
+  }
+
+  // Exit 0 whether the render succeeds, fails or is still running: the draft exists either way.
+  demo = await waitForRender(baseUrl, token, demo);
+  const { status, render_status, render_error, draft_url } = demo;
+  console.log(
+    JSON.stringify(
+      { id: demo.id, status, render_status: render_status ?? null, render_error: render_error ?? null, draft_url },
+      null,
+      2,
+    ),
+  );
+}
+
+async function areasList(baseUrl) {
+  const token = readCredentials()[baseUrl];
+  if (!token) throw needsLogin(`Not logged in to ${baseUrl}.`);
+
+  const result = await api(baseUrl, "/api/areas", { token });
+  if (result.status === 401) throw needsLogin("Token was rejected.");
+  if (result.status !== 200 || !Array.isArray(result.json?.areas)) throw new CliError(describe("/api/areas", result));
+  console.log(JSON.stringify({ areas: result.json.areas.map((area) => area.name) }, null, 2));
+}
+
+async function areasAdd(baseUrl, values) {
+  const name = textOption(values, "name", LIMITS.area);
+  if (!name) throw new CliError(`Missing --name-file.\n\n${USAGE}`);
+
+  const token = readCredentials()[baseUrl];
+  if (!token) throw needsLogin(`Not logged in to ${baseUrl}.`);
+
+  const result = await api(baseUrl, "/api/areas", { method: "POST", token, body: { name } });
+  if (result.status === 401) throw needsLogin("Token was rejected.");
+  if (result.status === 409) throw new CliError(`Area already exists: ${name}`);
+  if (result.status !== 201 || typeof result.json?.name !== "string")
+    throw new CliError(describe("/api/areas", result));
+  console.log(JSON.stringify({ name: result.json.name }, null, 2));
+}
+
+/** Every value in the project config is a non-empty string under a known key; returns it trimmed. */
+function validateProjectConfig(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new CliError("Config must be a JSON object.");
+  }
+  const config = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!PROJECT_CONFIG_KEYS.includes(key)) {
+      throw new CliError(`Unknown config key: ${key}. Allowed: ${PROJECT_CONFIG_KEYS.join(", ")}.`);
+    }
+    if (typeof value !== "string" || !value.trim()) throw new CliError(`Config key ${key} must be a non-empty string.`);
+    config[key] = value.trim();
+  }
+  return config;
+}
+
+/** The project config of the current directory, or {} when there is none. */
+function readProjectConfig() {
+  if (!existsSync(PROJECT_CONFIG_FILE)) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(PROJECT_CONFIG_FILE, "utf8"));
+  } catch {
+    throw new CliError(`${PROJECT_CONFIG_FILE} is not valid JSON; fix or delete it.`);
+  }
+  return validateProjectConfig(parsed);
+}
+
+function writeProjectConfig(config) {
+  mkdirSync(dirname(PROJECT_CONFIG_FILE), { recursive: true });
+  const text = JSON.stringify(config, null, 2) + "\n";
+  writeFileSync(PROJECT_CONFIG_FILE, text);
+  return text;
+}
+
+// The agent writes the JSON to a temp file and this command copies it into the repo, so the write
+// is covered by the same permission rule as login/whoami/create.
+function configSave(from) {
+  if (!from) throw new CliError(`Missing --from <file.json>.\n\n${USAGE}`);
+  if (!existsSync(from)) throw new CliError(`--from not found: ${from}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(from, "utf8"));
+  } catch {
+    throw new CliError(`--from is not valid JSON: ${from}`);
+  }
+  const text = writeProjectConfig(validateProjectConfig(parsed));
+  console.log(`Saved ${join(process.cwd(), PROJECT_CONFIG_FILE)}:\n${text}`);
+}
+
+// Copies the bundled fixture into the repo, so a committed spec can import it by a relative path and the
+// write is covered by the same permission rule as the rest of the kit.
+function fixtureInstall(dir) {
+  const target = (dir ?? DEFAULT_FIXTURE_DIR).trim() || DEFAULT_FIXTURE_DIR;
+  const absolute = resolve(target);
+  const protectedRoot = resolve(PROTECTED_DIR);
+  if (absolute === protectedRoot || absolute.startsWith(protectedRoot + sep)) {
+    throw new CliError(
+      `Refusing to install into ${protectedRoot}: ${PROTECTED_DIR}/ is a protected path an agent cannot write to. ` +
+        `Use --dir ${DEFAULT_FIXTURE_DIR} or another directory outside it.`,
+    );
+  }
+  if (!existsSync(BUNDLED_FIXTURE)) {
+    throw new CliError(`No bundled fixture at ${BUNDLED_FIXTURE}; this copy of the kit is incomplete.`);
+  }
+  // Read before the config, so an unreadable config stops the command before anything is written.
+  const fixture = readFileSync(BUNDLED_FIXTURE, "utf8");
+  const config = readProjectConfig();
+
+  mkdirSync(absolute, { recursive: true });
+  const file = join(target, FIXTURE_NAME);
+  writeFileSync(file, FIXTURE_STAMP(FIXTURE_VERSION) + fixture);
+  // Remember where it went: without this, `status` can only guess where a stale copy might be.
+  writeProjectConfig({ ...config, fixtureDir: target });
+  console.log(`Installed ${join(process.cwd(), file)} (fixture v${FIXTURE_VERSION}).`);
+  console.log(`Import it from a spec in ${target}/: import { test, expect } from "./${FIXTURE_NAME}";`);
+}
+
+/** The version stamped into an installed fixture; 0 when the stamp is missing or unreadable. */
+function fixtureVersion(file) {
+  try {
+    const match = FIXTURE_STAMP_PATTERN.exec(readFileSync(file, "utf8").split("\n", 1)[0]);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** The installed fixture copies in this directory: the one `fixture install` recorded, then the defaults. */
+function fixtureCopies() {
+  let configured;
+  try {
+    configured = readProjectConfig().fixtureDir;
+  } catch {
+    // A config this kit cannot read says nothing about the fixture; the defaults below still apply.
+  }
+  const dirs = [...new Set([configured, ...FIXTURE_SEARCH_DIRS].filter(Boolean))];
+  return dirs.map((dir) => join(dir, FIXTURE_NAME)).filter((file) => existsSync(file));
+}
+
+// Everything `status` reports, read from local files only: no network call, so the hook stays instant.
+function gatherStatus() {
+  const status = { baseUrl: null, loggedIn: false, legacyKit: existsSync(LEGACY_KIT_DIR), stale: [] };
+  try {
+    status.baseUrl = resolveBaseUrl();
+    status.loggedIn = Boolean(readCredentials()[status.baseUrl]);
+  } catch {
+    // A raw copy with no origin baked in, or a credentials file this kit cannot read. Either way there is
+    // no token to report; `status` without --hook shows the error itself.
+  }
+  status.stale = fixtureCopies().filter((file) => fixtureVersion(file) < FIXTURE_VERSION);
+  return status;
+}
+
+// The SessionStart text. It is injected into every session in the repo, including ones that have nothing
+// to do with demos, so it carries only the facts that apply and stays around 80 words.
+function hookText(status) {
+  const lines = [];
+  if (status.baseUrl && status.loggedIn) {
+    lines.push(`vch (Video Changelog Hub): this machine is authenticated for ${status.baseUrl}.`);
+  } else if (status.baseUrl) {
+    lines.push(
+      `vch (Video Changelog Hub): this machine is not authenticated for ${status.baseUrl}. When a demo is asked ` +
+        `for, offer to run \`${invocation()} login\` and relay the link and code it prints so the developer ` +
+        "approves it in the browser — do not run it silently, and do not wait on it before doing other work.",
+    );
+  }
+  if (status.legacyKit) {
+    lines.push(
+      `A legacy kit copy is in ${LEGACY_KIT_DIR}/; you may offer to remove it, as both skills match the same request.`,
+    );
+  }
+  if (status.stale.length) {
+    lines.push(`Fixture copy out of date: ${status.stale.join(", ")}. Re-run \`${invocation()} fixture install\`.`);
+  }
+  return lines.join("\n");
+}
+
+// Without --hook this is a normal command with the normal exit codes; with --hook it is a SessionStart
+// hook's stdout, which must never fail a session, so every error ends as silence and exit 0.
+function status(hook) {
+  if (hook) {
+    try {
+      const text = hookText(gatherStatus());
+      if (text) console.log(text);
+    } catch {
+      // Nothing this command could report is worth breaking a session over.
+    }
+    return;
+  }
+
+  const baseUrl = resolveBaseUrl();
+  const token = readCredentials()[baseUrl];
+  console.log(`Server:  ${baseUrl}`);
+  console.log(`Token:   ${token ? `present (run \`${invocation()} whoami\` to check it)` : "none"}`);
+  const copies = fixtureCopies();
+  console.log(
+    `Fixture: ${
+      copies.length
+        ? copies.map((file) => `${file} (v${fixtureVersion(file)}, current is v${FIXTURE_VERSION})`).join(", ")
+        : `not installed (run \`${invocation()} fixture install\`)`
+    }`,
+  );
+  if (existsSync(LEGACY_KIT_DIR)) {
+    console.log(`Legacy:  ${LEGACY_KIT_DIR}/ exists; remove it so only one draft-demo skill matches a request.`);
+  }
+  if (!token) throw needsLogin(`Not logged in to ${baseUrl}.`);
+}
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  if (!command || command === "--help" || command === "-h" || command === "help") {
+    console.log(USAGE);
+    return;
+  }
+  const subcommand = ["config", "areas", "fixture"].includes(command) ? rest.shift() : undefined;
+
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args: rest,
+      options: {
+        title: { type: "string" },
+        "title-file": { type: "string" },
+        "description-file": { type: "string" },
+        events: { type: "string" },
+        area: { type: "string" },
+        "area-file": { type: "string" },
+        name: { type: "string" },
+        "name-file": { type: "string" },
+        video: { type: "string" },
+        from: { type: "string" },
+        dir: { type: "string" },
+        hook: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
+    }));
+  } catch (error) {
+    throw new CliError(`${error.message}\n\n${USAGE}`);
+  }
+  if (values.help) {
+    console.log(USAGE);
+    return;
+  }
+
+  // Commands that touch only local files are dispatched before the origin is resolved: `status --hook`
+  // must stay silent and exit 0 even on a raw copy whose placeholder was never substituted.
+  if (command === "config") {
+    if (subcommand === "save") return configSave(values.from);
+    throw new CliError(`Unknown config command: ${subcommand ?? "(none)"}\n\n${USAGE}`);
+  }
+  if (command === "fixture") {
+    if (subcommand === "install") return fixtureInstall(values.dir);
+    throw new CliError(`Unknown fixture command: ${subcommand ?? "(none)"}\n\n${USAGE}`);
+  }
+  if (command === "status") return status(values.hook === true);
+
+  const baseUrl = resolveBaseUrl();
+  if (command === "login") return login(baseUrl);
+  if (command === "whoami") return whoami(baseUrl);
+  if (command === "logout") return logout(baseUrl);
+  if (command === "create") return create(baseUrl, values);
+  if (command === "areas") {
+    if (subcommand === "list") return areasList(baseUrl);
+    if (subcommand === "add") return areasAdd(baseUrl, values);
+    throw new CliError(`Unknown areas command: ${subcommand ?? "(none)"}\n\n${USAGE}`);
+  }
+  throw new CliError(`Unknown command: ${command}\n\n${USAGE}`);
+}
+
+try {
+  await main();
+  process.exit(0);
+} catch (error) {
+  console.error(`vch: ${error instanceof CliError ? error.message : (error?.stack ?? String(error))}`);
+  process.exit(error instanceof CliError ? error.exitCode : 1);
+}

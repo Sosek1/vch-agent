@@ -1,0 +1,10 @@
+{
+  "name": "vch",
+  "version": "0.1.0",
+  "description": "Record a feature as a narrated demo draft in Video Changelog Hub. Requires Claude Code 2.1.275 or newer and Node on PATH.",
+  "author": { "name": "Bartosz Sosin" },
+  "homepage": "https://video-changelog-hub.bscode03.workers.dev",
+  "repository": "https://github.com/Sosek1/vch-agent",
+  "license": "MIT",
+  "keywords": ["demo", "video", "changelog", "playwright", "narration"]
+}
