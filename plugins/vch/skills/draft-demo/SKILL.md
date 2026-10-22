@@ -8,10 +8,10 @@ allowed-tools: Bash(vch *)
 
 You turn a feature into a draft demo in one go. You do the judgment work (understand the feature, write the narrated test, write the title and description). `vch` does everything deterministic (login, upload, finalize, wait for the render).
 
-- Script: `vch`, a bare command on the Bash tool's PATH from this plugin (Node >= 18, no dependencies).
+- Script: `vch`, a bare command on the Bash tool's PATH from this plugin (Node >= 22.12, no dependencies).
 - Recording fixture: `vch-fixture.mjs`, copied into the repo by `vch fixture install` (step 0). The spec imports `test` and `expect` from it. It records the run and writes `demo.webm` and `events.json` (every wrapped click and typing, plus the narration) into the test's output dir. The hub turns them into a film that zooms in on each action, with the narration spoken by an English voice.
 - Server: the origin built into `vch` when this plugin was released (its `DEFAULT_BASE_URL`). Do not point it anywhere else; `create` prints the destination on stderr before uploading.
-- Permission: the developer allows the script once with the rule `Bash(vch *)` (Claude Code: `/permissions` → Allow). It covers `login`, `whoami`, `create`, `areas list`, `areas add`, `config save`, `fixture install` and `logout`.
+- Permission: this skill's `allowed-tools: Bash(vch *)` lets you run `vch` without a prompt, but only during the turn that invoked the skill. That is why the upload in step 9 runs in the foreground: the whole run has to finish inside that turn. For `vch` runs outside a skill turn, the developer can add the same rule once, optionally (Claude Code: `/permissions` → Allow → `Bash(vch *)`). It covers `login`, `whoami`, `create`, `areas list`, `areas add`, `config save`, `fixture install` and `logout`.
 
 Every run creates a **new** draft. Re-running never updates an earlier one.
 
@@ -106,7 +106,7 @@ All subcommands (`login`, `whoami`, `create`, `areas list`, `areas add`, `config
      --area-file <tmp>/vch-area.txt
    ```
 
-   Leave out `--area-file` when you chose no area in step 8. It uploads the recording and `events.json`, then waits while the hub renders the narrated film. That may take a few minutes (it prints progress on stderr; it gives up waiting after 25 minutes). Run it in the foreground, or in the background and wait for it to exit.
+   Leave out `--area-file` when you chose no area in step 8. It uploads the recording and `events.json`, then waits while the hub renders the narrated film. That may take a few minutes (it prints progress on stderr; it gives up waiting after 9 minutes, leaving the draft with the raw recording). Run it in the **foreground** and wait for it to exit; never start it as a background command, and give the Bash call a 10-minute timeout (600000 ms), the longest it allows. The permission grant ends with this turn, so a backgrounded upload lets the turn end and leaves steps 10–12 outside it.
 
    Exit `0` prints JSON `{ "id", "status", "render_status", "render_error", "draft_url" }` on stdout. The draft exists whenever the exit is `0`, whatever `render_status` says. Exit `1` with "Unknown product area" means the name is not on the list (nothing was uploaded): run `areas list` again and choose an exact name, or drop `--area-file`. Exit `2`: run `vch login` as in step 0, wait for it to exit `0`, then retry `create`. Exit `1`: see the exit codes above (a narration over the limits is reported before anything is uploaded; shorten the `say()` texts and re-run the spec). If the command is refused by permissions, point the developer to the `/permissions` rule.
 

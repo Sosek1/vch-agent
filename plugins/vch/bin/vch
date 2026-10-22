@@ -34,7 +34,8 @@ const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const COMPLETE_RETRIES = 3;
 const COMPLETE_RETRY_DELAY_MS = 2000;
 const RENDER_POLL_INTERVAL_MS = 10 * 1000;
-const RENDER_WAIT_MS = 25 * 60 * 1000;
+// Kept under the agent's 10-minute Bash tool limit, so the command reports a clean stop before the tool kills it.
+const RENDER_WAIT_MS = 9 * 60 * 1000;
 
 // Must match the server's limits (src/lib/services/demos.ts, src/lib/services/areas.ts).
 const LIMITS = { title: 120, description: 2000, transcript: 10000, area: 60 };
@@ -81,7 +82,7 @@ const USAGE = `Usage:
   node vch.mjs logout                         Revoke this agent's token on the server and forget it locally
   node vch.mjs create --title-file <f> --description-file <f> --events <events.json> --video <demo.webm>
                                               Upload a recording made with vch-fixture.mjs as a new draft and
-                                              wait (up to 25 min) for its narrated render. The transcript is the
+                                              wait (up to 9 min) for its narrated render. The transcript is the
                                               say() text from events.json. (--title <t> instead of --title-file also works)
                                               [--area-file <f>]  Product area, an exact name from \`areas list\`
                                               (--area <a> instead of --area-file also works)
@@ -620,7 +621,14 @@ function gatherStatus() {
 function hookText(status) {
   const lines = [];
   if (status.baseUrl && status.loggedIn) {
-    lines.push(`vch (Video Changelog Hub): this machine is authenticated for ${status.baseUrl}.`);
+    // Only the token's presence was checked, never its validity (that takes a network call), and tokens
+    // expire, so say exactly that and name the recovery instead of claiming the machine is authenticated.
+    lines.push(
+      `vch (Video Changelog Hub): a token for ${status.baseUrl} is saved on this machine; it was not checked ` +
+        `and may have expired (\`${invocation()} whoami\` checks it). If a \`${invocation()}\` command ` +
+        `reports the token was rejected, offer to run \`${invocation()} login\` and relay the link and code it ` +
+        "prints so the developer approves it in the browser.",
+    );
   } else if (status.baseUrl) {
     lines.push(
       `vch (Video Changelog Hub): this machine is not authenticated for ${status.baseUrl}. When a demo is asked ` +
