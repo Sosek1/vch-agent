@@ -585,6 +585,15 @@ function fixtureInstall(dir) {
         `Use --dir ${DEFAULT_FIXTURE_DIR} or another directory outside it.`,
     );
   }
+  // The skill grants `Bash(vch *)`, so this write is pre-approved and never reaches the permission
+  // classifier. Keep it inside the repo the developer is working in, where that approval was meant to apply.
+  const cwd = resolve(".");
+  if (absolute !== cwd && !absolute.startsWith(cwd + sep)) {
+    throw new CliError(
+      `Refusing to install into ${absolute}: --dir must stay inside ${cwd}. ` +
+        `Use --dir ${DEFAULT_FIXTURE_DIR} or another directory in this repo.`,
+    );
+  }
   if (!existsSync(BUNDLED_FIXTURE)) {
     throw new CliError(`No bundled fixture at ${BUNDLED_FIXTURE}; this copy of the kit is incomplete.`);
   }

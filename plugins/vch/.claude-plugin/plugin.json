@@ -1,6 +1,6 @@
 {
   "name": "vch",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Record a feature as a narrated demo draft in Video Changelog Hub. Requires Claude Code 2.1.275 or newer, Node 22.12 or newer on PATH, and @playwright/test 1.61 or newer in the target repo.",
   "author": { "name": "Bartosz Sosin" },
   "homepage": "https://video-changelog-hub.bscode03.workers.dev",
