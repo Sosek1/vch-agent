@@ -359,18 +359,20 @@ const formatElapsed = (ms) => `${Math.floor(ms / 60000)}m ${String(Math.floor((m
 
 // The deadline bounds the PUT, so a slow uplink fails with a message rather than being killed mid-upload.
 async function putFile(label, url, contentType, body, deadline) {
+  // The window this PUT is actually given; the message quotes it, not the whole budget.
+  const remaining = Math.max(deadline - Date.now(), 1);
   let upload;
   try {
     upload = await fetch(url, {
       method: "PUT",
       headers: { "Content-Type": contentType },
       body,
-      signal: AbortSignal.timeout(Math.max(deadline - Date.now(), 1)),
+      signal: AbortSignal.timeout(remaining),
     });
   } catch (error) {
     if (error.name === "TimeoutError") {
       throw new CliError(
-        `${label} upload did not finish within ${formatElapsed(CREATE_BUDGET_MS)}. The draft was left without a recording; record a shorter demo or retry on a faster connection.`,
+        `${label} upload did not finish within the ${formatElapsed(remaining)} left of the ${formatElapsed(CREATE_BUDGET_MS)} budget. The draft was left without a recording; record a shorter demo or retry on a faster connection.`,
       );
     }
     throw new CliError(`${label} upload failed: ${error.message}`);
@@ -383,40 +385,46 @@ async function putFile(label, url, contentType, body, deadline) {
 
 // Polls the draft while the narrated video renders. The draft already exists, so a failed poll never
 // fails the command: transient errors are retried, anything else stops the wait with the last known state.
+// Returns the last known state and when the last poll answered (`started` when there was no poll), so the
+// caller reports only the render time it measured.
 async function waitForRender(baseUrl, token, demo, deadline) {
   const statusPath = `/api/demos/${encodeURIComponent(demo.id)}`;
   const started = Date.now();
   let current = demo;
+  let lastPollAt = started;
+  if (current.render_status === "rendering") console.error("Render: started");
   while (current.render_status === "rendering") {
     const elapsed = Date.now() - started;
     // Stop before a poll that could finish past the deadline.
     if (Date.now() + RENDER_POLL_INTERVAL_MS + API_TIMEOUT_MS > deadline) {
       console.error(
-        `Stopped waiting after ${formatElapsed(elapsed)}; the render is still running. The draft plays the raw recording until it finishes.`,
+        `Render: stopped waiting after ${formatElapsed(elapsed)}; the render is still running. The draft plays the raw recording until it finishes.`,
       );
-      return current;
+      return { demo: current, lastPollAt };
     }
-    console.error(`Rendering the narrated video... ${formatElapsed(elapsed)} elapsed`);
+    console.error(`Render: ${formatElapsed(elapsed)} elapsed`);
     await sleep(RENDER_POLL_INTERVAL_MS);
     let poll;
     try {
       poll = await api(baseUrl, statusPath, { token });
     } catch (error) {
-      console.error(`vch: ${error.message}; retrying.`);
+      lastPollAt = Date.now();
+      console.error(`Render: ${error.message}; retrying.`);
       continue;
     }
+    lastPollAt = Date.now();
     if (poll.status === 200 && poll.json) {
       current = { ...current, render_status: poll.json.render_status, render_error: poll.json.render_error };
       continue;
     }
     if (poll.status >= 500) {
-      console.error(`vch: ${describe(statusPath, poll)}; retrying.`);
+      console.error(`Render: ${describe(statusPath, poll)}; retrying.`);
       continue;
     }
-    console.error(`vch: ${describe(statusPath, poll)}; stopped waiting for the render.`);
-    return current;
+    console.error(`Render: ${describe(statusPath, poll)}; stopped waiting for the render.`);
+    return { demo: current, lastPollAt };
   }
-  return current;
+  return { demo: current, lastPollAt };
 }
 
 async function create(baseUrl, values) {
@@ -445,8 +453,9 @@ async function create(baseUrl, values) {
   if (!token) throw needsLogin(`Not logged in to ${baseUrl}.`);
 
   // stderr, so stdout stays pure JSON.
-  console.error(`Creating draft on ${baseUrl}`);
-  const deadline = Date.now() + CREATE_BUDGET_MS;
+  console.error(`Upload: creating draft on ${baseUrl}`);
+  const uploadStarted = Date.now();
+  const deadline = uploadStarted + CREATE_BUDGET_MS;
   // Sent only when given, so the request matches what kits without areas send.
   const body = { title, description, transcript, ...(area ? { area } : {}) };
   const created = await api(baseUrl, "/api/demos", { method: "POST", token, body });
@@ -461,7 +470,7 @@ async function create(baseUrl, values) {
   }
   const { id, upload_url, events_upload_url } = created.json;
 
-  console.error("Uploading recording");
+  console.error("Upload: sending recording");
   await putFile("Video", upload_url, "video/webm", readFileSync(videoPath), deadline);
   await putFile("events.json", events_upload_url, "application/json", events, deadline);
 
@@ -476,6 +485,12 @@ async function create(baseUrl, values) {
       break;
     }
     if (done.status === 409 && done.json?.error === "not_uploaded" && attempt < COMPLETE_RETRIES) {
+      // Stop before a retry that could finish past the deadline.
+      if (Date.now() + COMPLETE_RETRY_DELAY_MS + API_TIMEOUT_MS > deadline) {
+        throw new CliError(
+          `Upload: stopped after ${formatElapsed(Date.now() - uploadStarted)}; the hub had not confirmed the recording. Draft ${id} exists but has no finalized recording. Do not run create again blindly: check the draft in the hub first.`,
+        );
+      }
       await sleep(COMPLETE_RETRY_DELAY_MS);
       continue;
     }
@@ -483,12 +498,18 @@ async function create(baseUrl, values) {
   }
 
   // Printed before the wait, so a run cut off during it still leaves the draft's address behind.
+  const draftCreatedAt = Date.now();
   console.error(
     `Draft created: ${demo.draft_url} (id ${demo.id}). If this command is cut off from here on, the draft exists; do not run create again.`,
   );
   // Exit 0 whether the render succeeds, fails or is still running: the draft exists either way.
-  demo = await waitForRender(baseUrl, token, demo, deadline);
+  const rendered = await waitForRender(baseUrl, token, demo, deadline);
+  demo = rendered.demo;
   const { status, render_status, render_error, draft_url } = demo;
+  // Measured times and the last render status seen, nothing more: a render still running is reported as such.
+  console.error(
+    `Timing: upload ${formatElapsed(draftCreatedAt - uploadStarted)}, render ${formatElapsed(rendered.lastPollAt - draftCreatedAt)} (${render_status ?? "unknown"})`,
+  );
   console.log(
     JSON.stringify(
       { id: demo.id, status, render_status: render_status ?? null, render_error: render_error ?? null, draft_url },
